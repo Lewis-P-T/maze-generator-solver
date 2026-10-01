@@ -1,6 +1,9 @@
 """Maze Generator & Solver — stdlib only."""
 import argparse
 import heapq
+import json
+import os
+import tempfile
 import random
 from collections import deque
 
@@ -25,6 +28,36 @@ class Maze:
         dx, dy = DIRS[d]
         self.cells[y][x].add(d)
         self.cells[y + dy][x + dx].add(OPPOSITE[d])
+
+    def to_json(self):
+        return {"width": self.width, "height": self.height,
+                "cells": [["".join(sorted(c)) for c in row] for row in self.cells]}
+
+    @classmethod
+    def from_json(cls, data):
+        """Rebuild a maze, rejecting malformed data or one-sided passages."""
+        w, h = data["width"], data["height"]
+        cells = data["cells"]
+        if not (isinstance(w, int) and isinstance(h, int) and w >= 1 and h >= 1)                 or len(cells) != h or any(len(row) != w for row in cells):
+            raise ValueError("maze dimensions don't match cell grid")
+        maze = cls(w, h)
+        for y, row in enumerate(cells):
+            for x, dirs in enumerate(row):
+                for d in dirs:
+                    nx, ny = x + DIRS[d][0], y + DIRS[d][1]
+                    if not (0 <= nx < w and 0 <= ny < h) or OPPOSITE[d] not in cells[ny][nx]:
+                        raise ValueError(f"bad passage {d} at ({x}, {y})")
+                    maze.cells[y][x].add(d)
+        return maze
+
+    def save(self, path):
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(self.to_json(), f)
+
+    @classmethod
+    def load(cls, path):
+        with open(path, encoding="utf-8") as f:
+            return cls.from_json(json.load(f))
 
     def render(self, path=()):
         """ASCII maze; cells in `path` are marked with a dot."""
@@ -205,6 +238,20 @@ def self_check():
     m = Maze(2, 2)
     m.carve(0, 0, "E"); m.carve(0, 0, "S"); m.carve(1, 0, "S"); m.carve(0, 1, "E")
     assert len(solve_bfs(m)[0]) == len(solve_astar(m)[0]) == 3
+    # JSON round-trip (file + in-memory) and rejection of a one-sided passage
+    m = generate_kruskal(7, 4, rng)
+    fd, tmp = tempfile.mkstemp(suffix=".json")
+    os.close(fd)
+    try:
+        m.save(tmp)
+        assert Maze.load(tmp).cells == m.cells
+    finally:
+        os.remove(tmp)
+    try:
+        Maze.from_json({"width": 2, "height": 1, "cells": [["E", ""]]})
+        raise AssertionError("one-sided passage accepted")
+    except ValueError:
+        pass
     # walled-off goal => no path
     assert solve_astar(Maze(2, 1))[0] is None and solve_dfs(Maze(2, 1))[0] is None
     print("self-check passed")
@@ -219,13 +266,25 @@ def main(argv=None):
     ap.add_argument("-a", "--solver", choices=SOLVERS, default="bfs", help="solver whose path is drawn")
     ap.add_argument("--no-solve", action="store_true", help="print the maze without the solution")
     ap.add_argument("--compare", action="store_true", help="print a stats table for every solver")
+    ap.add_argument("--save", metavar="FILE", help="save the generated maze to a JSON file")
+    ap.add_argument("--load", metavar="FILE", help="load a maze from a JSON file instead of generating one")
     ap.add_argument("--check", action="store_true", help="run the self-check and exit")
     args = ap.parse_args(argv)
     if args.check:
         return self_check()
     if args.width < 1 or args.height < 1:
         ap.error("width and height must be at least 1")
-    maze = GENERATORS[args.generator](args.width, args.height, random.Random(args.seed))
+    if args.load:
+        try:
+            maze = Maze.load(args.load)
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            ap.error(f"can't load {args.load}: {e}")
+        args.generator = "loaded"
+    else:
+        maze = GENERATORS[args.generator](args.width, args.height, random.Random(args.seed))
+    if args.save:
+        maze.save(args.save)
+        print(f"saved to {args.save}")
     print(maze.render())
     if not args.no_solve:
         path, visited = SOLVERS[args.solver](maze)
