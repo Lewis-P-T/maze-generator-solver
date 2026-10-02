@@ -1,6 +1,8 @@
 """Maze Generator & Solver — stdlib only."""
 import argparse
+import contextlib
 import heapq
+import io
 import json
 import os
 import tempfile
@@ -59,14 +61,17 @@ class Maze:
         with open(path, encoding="utf-8") as f:
             return cls.from_json(json.load(f))
 
-    def render(self, path=()):
-        """ASCII maze; cells in `path` are marked with a dot."""
-        on_path = set(path)
+    def render(self, path=(), marks=None):
+        """ASCII maze; cells in `path` get a dot, `marks` maps cell -> single char (wins over path)."""
+        on_path, marks = set(path), marks or {}
         lines = ["+" + "---+" * self.width]
         for y in range(self.height):
             row, floor = "|", "+"
             for x in range(self.width):
-                mark = " . " if (x, y) in on_path else "   "
+                if (x, y) in marks:
+                    mark = f" {marks[(x, y)]} "
+                else:
+                    mark = " . " if (x, y) in on_path else "   "
                 row += mark + (" " if "E" in self.cells[y][x] else "|")
                 floor += ("   " if "S" in self.cells[y][x] else "---") + "+"
             lines += [row, floor]
@@ -203,6 +208,163 @@ def solve_astar(maze, start=(0, 0), goal=None):
 SOLVERS = {"bfs": solve_bfs, "dfs": solve_dfs, "astar": solve_astar}
 
 
+# ---------- play mode ----------
+
+KEYS = {"w": "N", "s": "S", "d": "E", "a": "W"}
+SCORES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "maze_scores.json")
+
+
+def apply_moves(maze, pos, keys):
+    """Walk from pos following WASD keys; walls block (no move). Returns (pos, moves made, bumps)."""
+    moves = bumps = 0
+    for k in keys.lower():
+        d = KEYS.get(k)
+        if d is None:
+            continue
+        x, y = pos
+        if d in maze.cells[y][x]:
+            pos = (x + DIRS[d][0], y + DIRS[d][1])
+            moves += 1
+        else:
+            bumps += 1
+    return pos, moves, bumps
+
+
+def load_scores(path=SCORES_FILE):
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def record_score(key, moves, optimal, path=SCORES_FILE):
+    """Keep the fewest-moves result per maze key. Returns True if it's a new best."""
+    scores = load_scores(path)
+    old = scores.get(key)
+    if old is not None and old["moves"] <= moves:
+        return False
+    scores[key] = {"moves": moves, "optimal": optimal}
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(scores, f, indent=1, sort_keys=True)
+    return True
+
+
+def play(maze, key, input_fn=input, scores_path=SCORES_FILE):
+    """Interactive walk from top-left to bottom-right. Returns moves taken, or None if quit."""
+    goal = (maze.width - 1, maze.height - 1)
+    optimal = len(solve_bfs(maze)[0]) - 1
+    pos, moves, trail = (0, 0), 0, [(0, 0)]
+    print(f"Reach G with WASD (several keys per line ok, e.g. 'ddsd'). q quits. Optimal: {optimal} moves.")
+    while pos != goal:
+        print(maze.render(trail, {goal: "G", pos: "@"}))
+        try:
+            line = input_fn(f"moves {moves}> ").strip()
+        except EOFError:
+            line = "q"
+        if line.lower().startswith("q"):
+            print("gave up.")
+            return None
+        for k in line:  # step key by key so the trail records every cell
+            pos, m, b = apply_moves(maze, pos, k)
+            moves += m
+            if m:
+                trail.append(pos)
+            if b:
+                print("bump! wall that way.")
+            if pos == goal:
+                break
+    print(maze.render(trail, {goal: "@"}))
+    extra = moves - optimal
+    print(f"Solved in {moves} moves (optimal {optimal}" + (", perfect!)" if extra == 0 else f", +{extra})"))
+    if record_score(key, moves, optimal, scores_path):
+        print("New best score for this maze!")
+    return moves
+
+
+# ---------- menu mode ----------
+
+def _ask(input_fn, prompt, default, cast=str, choices=None):
+    raw = input_fn(f"{prompt} [{default}]: ").strip()
+    if not raw:
+        return default
+    try:
+        val = cast(raw)
+    except ValueError:
+        val = None
+    if val is None or (choices and val not in choices) or (cast is int and val < 1):
+        print("invalid, using default")
+        return default
+    return val
+
+
+def menu(input_fn=input, scores_path=SCORES_FILE):
+    """Text menu tying everything together. input_fn is injectable for the self-check."""
+    state = {"gen": "backtracker", "w": 15, "h": 8, "seed": random.randrange(10 ** 6)}
+    maze = GENERATORS[state["gen"]](state["w"], state["h"], random.Random(state["seed"]))
+
+    def key():
+        return f"{state['gen']}-{state['w']}x{state['h']}-{state['seed']}"
+
+    while True:
+        print(f"\n== Maze menu == current: {key()}")
+        print("1) new maze  2) show  3) solve  4) compare solvers  5) play  6) save  7) load  8) best scores  q) quit")
+        try:
+            choice = input_fn("> ").strip().lower()
+        except EOFError:
+            choice = "q"
+        if choice == "1":
+            state["gen"] = _ask(input_fn, "generator " + "/".join(GENERATORS), state["gen"], choices=GENERATORS)
+            state["w"] = _ask(input_fn, "width", state["w"], int)
+            state["h"] = _ask(input_fn, "height", state["h"], int)
+            state["seed"] = _ask(input_fn, "seed", random.randrange(10 ** 6), int)
+            maze = GENERATORS[state["gen"]](state["w"], state["h"], random.Random(state["seed"]))
+            print(maze.render())
+        elif choice == "2":
+            print(maze.render())
+        elif choice == "3":
+            name = _ask(input_fn, "solver " + "/".join(SOLVERS), "bfs", choices=SOLVERS)
+            path, visited = SOLVERS[name](maze)
+            print(maze.render(path))
+            print(f"{name.upper()}: path {len(path)} cells, visited {visited}")
+        elif choice == "4":
+            print(f"{'solver':<8}{'path':>6}{'visited':>9}")
+            for name, solve in SOLVERS.items():
+                path, visited = solve(maze)
+                print(f"{name:<8}{len(path):>6}{visited:>9}")
+        elif choice == "5":
+            play(maze, key(), input_fn, scores_path)
+        elif choice == "6":
+            fname = _ask(input_fn, "save to", "maze.json")
+            try:
+                maze.save(fname)
+                print(f"saved to {fname}")
+            except OSError as e:
+                print(f"save failed: {e}")
+        elif choice == "7":
+            fname = _ask(input_fn, "load from", "maze.json")
+            try:
+                maze = Maze.load(fname)
+            except (OSError, ValueError, KeyError, TypeError) as e:
+                print(f"load failed: {e}")
+                continue
+            # loaded mazes are keyed by file name so their scores stay separate
+            state.update(gen="file", w=maze.width, h=maze.height, seed=os.path.basename(fname))
+            print(maze.render())
+        elif choice == "8":
+            scores = load_scores(scores_path)
+            if not scores:
+                print("no scores yet - play a maze!")
+            for k, v in sorted(scores.items()):
+                print(f"{k:<32}{v['moves']:>5} moves (optimal {v['optimal']})")
+        elif choice.startswith("q"):
+            print("bye!")
+            return
+        else:
+            print("unknown option")
+
+
 def self_check():
     rng = random.Random(42)
     for gname, gen in GENERATORS.items():
@@ -254,6 +416,35 @@ def self_check():
         pass
     # walled-off goal => no path
     assert solve_astar(Maze(2, 1))[0] is None and solve_dfs(Maze(2, 1))[0] is None
+    # play mode: walls block, a scripted solve records a best score, menu drives everything
+    m = generate_backtracker(6, 4, random.Random(3))
+    assert apply_moves(Maze(2, 1), (0, 0), "dx")[1:] == (0, 1)
+    path = solve_bfs(m)[0]
+    route = "".join(next(k for k, d in KEYS.items() if (a[0] + DIRS[d][0], a[1] + DIRS[d][1]) == b)
+                    for a, b in zip(path, path[1:]))
+    assert apply_moves(m, (0, 0), route) == ((5, 3), len(path) - 1, 0)
+    assert m.render(marks={(0, 0): "@"}).count(" @ ") == 1
+    bump = next(k for k, d in KEYS.items() if d not in m.cells[0][0])
+    fd, scores = tempfile.mkstemp(suffix=".json")
+    os.close(fd)
+    os.remove(scores)
+    try:
+        feed = iter([bump, route[:2], route[2:]])
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            assert play(m, "k", lambda _: next(feed), scores) == len(path) - 1
+        assert "perfect" in out.getvalue() and "bump" in out.getvalue()
+        assert load_scores(scores)["k"]["moves"] == len(path) - 1
+        assert not record_score("k", len(path) + 5, len(path) - 1, scores)  # worse => old kept
+        assert record_score("j", 9, 7, scores) and set(load_scores(scores)) == {"j", "k"}
+        feed = iter(["1", "kruskal", "5", "3", "11", "2", "3", "astar", "4", "5", "q", "8", "zz", "q"])
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            menu(lambda _: next(feed), scores)
+        text = out.getvalue()
+        assert "kruskal-5x3-11" in text and "ASTAR" in text and "gave up" in text and "bye!" in text
+        assert "unknown option" in text and "optimal 7" in text
+    finally:
+        if os.path.exists(scores):
+            os.remove(scores)
     print("self-check passed")
 
 
@@ -268,10 +459,14 @@ def main(argv=None):
     ap.add_argument("--compare", action="store_true", help="print a stats table for every solver")
     ap.add_argument("--save", metavar="FILE", help="save the generated maze to a JSON file")
     ap.add_argument("--load", metavar="FILE", help="load a maze from a JSON file instead of generating one")
+    ap.add_argument("--play", action="store_true", help="walk the maze yourself with WASD")
+    ap.add_argument("--menu", action="store_true", help="interactive menu (generate/solve/play/save/load)")
     ap.add_argument("--check", action="store_true", help="run the self-check and exit")
     args = ap.parse_args(argv)
     if args.check:
         return self_check()
+    if args.menu:
+        return menu()
     if args.width < 1 or args.height < 1:
         ap.error("width and height must be at least 1")
     if args.load:
@@ -280,11 +475,18 @@ def main(argv=None):
         except (OSError, ValueError, KeyError, TypeError) as e:
             ap.error(f"can't load {args.load}: {e}")
         args.generator = "loaded"
+        key = f"file-{maze.width}x{maze.height}-{os.path.basename(args.load)}"
     else:
+        if args.seed is None:
+            args.seed = random.randrange(10 ** 6)  # pick one so play scores get a reproducible key
         maze = GENERATORS[args.generator](args.width, args.height, random.Random(args.seed))
+        key = f"{args.generator}-{args.width}x{args.height}-{args.seed}"
     if args.save:
         maze.save(args.save)
         print(f"saved to {args.save}")
+    if args.play:
+        print(f"maze: {key}")
+        return play(maze, key)
     print(maze.render())
     if not args.no_solve:
         path, visited = SOLVERS[args.solver](maze)
